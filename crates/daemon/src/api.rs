@@ -1054,6 +1054,10 @@ pub(crate) async fn wait_attention(app: &App, id: PaneId, needs_input: bool) -> 
         let block = app.mux.api(|r| Api::Block(id, r)).await.flatten().map(|b| b.state());
         let found = block.and_then(|s| {
             let a = serde_json::from_value::<Attention>(s["attention"].clone()).ok()?;
+            // #606: an agent that will carry on by itself (its turn held for
+            // background work, or tasks it left running) isn't idle yet.
+            let carries_on = s["held"] == true || s["background"].as_array().is_some_and(|b| !b.is_empty());
+            let a = if carries_on && a != Attention::NeedsInput { Attention::Working } else { a };
             // The question it waits on: the first one not already opened.
             let ask = s["asks"]
                 .as_array()

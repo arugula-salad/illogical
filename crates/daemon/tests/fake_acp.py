@@ -35,6 +35,14 @@ Prompts:
                  Code does when it has titled the conversation, #629
   stream N MS    N one-word chunks of a reply, MS milliseconds apart, as
                  Claude Code streams, #713
+  bg SECS        a shell command run in the background, as Claude Code
+                 reports one (#606): its task id in the tool's response, its
+                 output in $FAKE_ACP_DIR/tasks/<id>.output, which ends with
+                 "[exited with code 0]" SECS later; then the agent wakes as
+                 for "wake"
+  held           as claude-agent-acp while background subagents live: the
+                 result's usage_update, then the prompt's answer held for 30s
+                 (a cancel answers it at once)
   model          says the model set_config_option chose
   mode           says the permission mode session/set_mode chose (it knows
                  claude-agent-acp's: default, acceptEdits, plan, auto)
@@ -527,6 +535,22 @@ def prompt(mid, p):
         save(sid, s)
         send({"id": mid, "error": {"code": -32000, "message": "Authentication required"}})
         return
+    elif text.startswith("bg "):
+        task = f"bg{n}"
+        out = os.path.join(DIR, "tasks", f"{task}.output")
+        os.makedirs(os.path.dirname(out), exist_ok=True)
+        with open(out, "w") as f:
+            f.write("started\n")
+        tc = f"t{n}"
+        meta = {"claudeCode": {"toolName": "Bash"}}
+        update(sid, s, {"sessionUpdate": "tool_call", "toolCallId": tc, "title": "sleep", "kind": "execute",
+                        "status": "pending", "rawInput": {"command": "sleep", "run_in_background": True}, "_meta": meta})
+        update(sid, s, {"sessionUpdate": "tool_call_update", "toolCallId": tc, "_meta": {"claudeCode": {
+            "toolName": "Bash", "toolResponse": {"backgroundTaskId": task, "stdout": "", "stderr": ""}}}})
+        said = f"Command running in background with ID: {task}. Output is being written to: {out}. You will be notified when it completes."
+        update(sid, s, {"sessionUpdate": "tool_call_update", "toolCallId": tc, "status": "completed", "_meta": meta,
+                        "content": [{"type": "content", "content": {"type": "text", "text": said}}]})
+        msg("Waiting on the background task.")
     else:
         msg("Hello! I am fake.")
     if stop != "cancelled":
@@ -535,8 +559,15 @@ def prompt(mid, p):
                         "cost": {"amount": s["cost"], "currency": "USD"}})
     save(sid, s)
     if text == "held":
-        time.sleep(30)
+        for _ in range(300):
+            if sid in cancelled:
+                cancelled.discard(sid)
+                stop = "cancelled"
+                break
+            time.sleep(0.1)
     send({"id": mid, "result": {"stopReason": stop, "usage": {"inputTokens": 1, "outputTokens": 2, "totalTokens": 3}}})
+    if text.startswith("bg "):
+        threading.Thread(target=background, args=(sid, s, n, float(text.split()[1]), task), daemon=True).start()
     if text in ("wake", "wake-open"):
         # As claude-agent-acp when a background task finishes after the turn:
         # output outside any prompt, closed by an autonomous-origin usage_update
@@ -551,6 +582,23 @@ def prompt(mid, p):
                 "sessionUpdate": "usage_update", "used": 12, "size": 1000,
                 "cost": {"amount": s["cost"], "currency": "USD"},
                 "_meta": {"_claude/origin": {"kind": "task-notification"}}}}})
+
+
+def background(sid, s, n, secs, task):
+    """A background task's end, as Claude Code writes it, then the agent
+    waking for it."""
+    time.sleep(secs)
+    with open(os.path.join(DIR, "tasks", f"{task}.output"), "a") as f:
+        f.write("done\n\n[exited with code 0]\n")
+    time.sleep(0.3)
+    send({"method": "session/update", "params": {"sessionId": sid, "update": {
+        "sessionUpdate": "agent_message_chunk", "messageId": f"w{n}",
+        "content": {"type": "text", "text": "The background task finished."}}}})
+    time.sleep(0.5)
+    send({"method": "session/update", "params": {"sessionId": sid, "update": {
+        "sessionUpdate": "usage_update", "used": 12, "size": 1000,
+        "cost": {"amount": s["cost"] + 0.01, "currency": "USD"},
+        "_meta": {"_claude/origin": {"kind": "task-notification"}}}}})
 
 
 def handle(m):

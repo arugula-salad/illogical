@@ -48,6 +48,7 @@
 //! happens by itself (`none` and `rerun-ask` wait for "Resume").
 
 pub mod adapters;
+mod background;
 pub mod chant;
 pub mod defs;
 pub mod images;
@@ -341,6 +342,9 @@ struct Inner {
     /// by a finished background task; it ends with an autonomous
     /// `usage_update`, a prompt of ours, or [`autonomous_quiet`].
     autonomous_at: Option<std::time::Instant>,
+    /// What it left running in the background (#606): it carries on when
+    /// they end, so `wait --idle` waits.
+    background: background::Background,
     queue: VecDeque<Queued>,
     cost: Option<f64>,
     currency: Option<String>,
@@ -485,6 +489,7 @@ impl Inner {
             prompt_id: None,
             result_in: false,
             autonomous_at: None,
+            background: Default::default(),
             queue: VecDeque::new(),
             cost: None,
             currency: None,
@@ -638,6 +643,7 @@ impl Inner {
             "login" => self.login = e["login"].as_str().map(str::to_owned),
             "spawn" => {
                 // A new server: nothing outstanding carries over.
+                self.background.clear();
                 let cut_now = self.prompt_id.is_some() || !self.pending.is_empty() || !self.asks.is_empty();
                 if cut_now {
                     self.interrupted = true;
@@ -664,6 +670,7 @@ impl Inner {
                 }
             }
             "exit" | "stopped" => {
+                self.background.clear();
                 if self.prompt_id.is_some() {
                     self.interrupted = true;
                 }
@@ -809,7 +816,9 @@ impl Inner {
                         self.t.user(&text, images, at);
                         self.prompt_id = Some(id);
                         self.result_in = false;
-                        self.autonomous_at = None;
+                        if self.autonomous_at.take().is_some() {
+                            self.end_woken(at);
+                        }
                         self.status = Status::Working;
                         self.error = None;
                         self.last_stop = None;
@@ -978,8 +987,8 @@ impl Inner {
                             self.result_in = true;
                         }
                         // An autonomous cycle's close.
-                        if claude && self.replay.is_none() && origin != "human" {
-                            self.autonomous_at = None;
+                        if claude && self.replay.is_none() && origin != "human" && self.autonomous_at.take().is_some() {
+                            self.end_woken(at);
                         }
                         if let Some(amount) = u["cost"]["amount"].as_f64() {
                             self.cost = Some(amount);
@@ -1007,7 +1016,19 @@ impl Inner {
                             && self.status == Status::Ready
                             && self.agent_info["name"].as_str().is_some_and(|n| n.contains("claude-agent-acp"))
                         {
+                            if self.autonomous_at.is_none() {
+                                // #700: a turn of its own, counted like one.
+                                self.turns.push(TurnStat {
+                                    prompt: WOKEN.into(),
+                                    started_ms: at,
+                                    cost_base: self.cost,
+                                    ..Default::default()
+                                });
+                            }
                             self.autonomous_at = Some(std::time::Instant::now());
+                        }
+                        if self.replay.is_none() && self.live {
+                            self.background.saw(u, std::time::Instant::now());
                         }
                         let applied = match self.replay.as_mut() {
                             Some(r) => r.apply(u, at),
@@ -1194,6 +1215,14 @@ impl Inner {
         }
     }
 
+    /// A woken cycle ended (#700): its turn did.
+    fn end_woken(&mut self, at: u64) {
+        if let Some(t) = self.turns.last_mut().filter(|t| t.prompt == WOKEN && t.ended_ms.is_none()) {
+            t.ended_ms = Some(at);
+            t.stop = Some("end_turn".into());
+        }
+    }
+
     fn done_text(&self) -> String {
         self.t
             .entries
@@ -1279,6 +1308,10 @@ impl Inner {
         // M76: the recipe it wears, by name (as `as_fountain` is the
         // Fountain agent's).
         state["recipe"] = json!(self.cfg.def.recipe);
+        // #606: it will carry on by itself (its turn held for background
+        // work, or tasks it left running): `wait --idle` waits.
+        state["held"] = json!(self.status == Status::Working && self.result_in);
+        state["background"] = json!(self.background.ids());
         state
     }
 }
@@ -1879,6 +1912,7 @@ async fn run(
     let mut machine_up = false;
     let (mut retry_at, mut retries): (Option<tokio::time::Instant>, u32) = (None, 0);
     let mut follow_at = tokio::time::Instant::now() + FOLLOW_EVERY;
+    let mut prune_at = tokio::time::Instant::now();
     // What it was before a restart, for the "needs you" list.
     publish(&ctx, &inner, true);
     loop {
@@ -1950,7 +1984,17 @@ async fn run(
                     let mut g = inner.lock().unwrap();
                     if g.autonomous_at.is_some_and(|t| t.elapsed() >= autonomous_quiet()) {
                         g.autonomous_at = None;
+                        g.end_woken(now_ms());
                         dirty = true;
+                    }
+                    // #606: what it left running, checked on this host only.
+                    if ctx.sprite.is_some() {
+                        g.background.clear();
+                    } else if !g.background.tasks.is_empty()
+                        && tokio::time::Instant::now() >= prune_at
+                    {
+                        prune_at = tokio::time::Instant::now() + Duration::from_secs(1);
+                        dirty |= g.background.prune(std::time::Instant::now());
                     }
                 }
                 if dirty {
@@ -2063,6 +2107,9 @@ fn publish(ctx: &AgentCtx, inner: &Arc<Mutex<Inner>>, first: bool) {
     drop(g);
     ctx.changed();
 }
+
+/// A turn the agent took by itself, woken by a background task (#700).
+const WOKEN: &str = "(woken by a background task)";
 
 /// Why a block whose turn the daemon's restart cut off needs you (#680).
 const CUT_OFF: &str = "the daemon restarted and cut its turn off";
@@ -2650,7 +2697,11 @@ impl Agent {
 
     fn cancel(&self) -> Result<Value, String> {
         let mut g = self.inner.lock().unwrap();
-        g.note(json!({ "e": "queue_clear" }));
+        // A held turn's work is done (#606): stopping it is to get on to
+        // what's queued, not to drop it.
+        if !g.result_in {
+            g.note(json!({ "e": "queue_clear" }));
+        }
         // Open questions aren't answered: the agent withdraws them itself
         // (`$/cancel_request`), and answering `cancel` would only fail the
         // tool and let the turn carry on (S13).
