@@ -148,6 +148,9 @@ impl Daemon {
                 self.soon();
             }
             ClientMsg::Follow { pane, on } => self.follow(client, pane, on),
+            ClientMsg::BlockPatches => {
+                self.patched.insert(client, Default::default());
+            }
             ClientMsg::CallJoin { session } => self.call_join(&sub, session),
             ClientMsg::CallLeave { session } => self.call_leave(&sub, session),
             ClientMsg::CallMute { session, muted } => self.call_mute(&sub, session, muted),

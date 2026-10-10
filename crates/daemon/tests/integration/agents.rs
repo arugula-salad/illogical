@@ -243,6 +243,40 @@ fn a_burst_of_chunks_is_sent_to_clients_once_per_tick() {
 }
 
 #[test]
+fn a_client_that_takes_patches_is_sent_what_changed() {
+    // #713: a page that asks for patches gets an agent's new entries, not
+    // its whole transcript again, and they add up to the block's state.
+    let d = Daemon::child();
+    let id = d.open("hello");
+    assert_eq!(d.wait(id, "idle"), "done");
+    let s = d.fixture("agent_patches", "a client that takes patches follows an agent streaming");
+    let mut ws = s.ws();
+    let mut state = ws.until("the block's state", |m| m["type"] == "block" && m["block"] == id)["state"].clone();
+    ws.send(json!({ "type": "block_patches" }));
+    d.call(id, "send", json!({ "text": "stream 20 10" }));
+    let (mut patches, mut sent, mut whole) = (0, 0, 0);
+    loop {
+        let m = ws.until("a block state", |m| m["type"] == "block" && m["block"] == id);
+        let next = m["state"].clone();
+        if next.get("entries_at").is_some() {
+            patches += 1;
+            sent += next.to_string().len();
+            whole += arugula_proto::block_patch::merge(&state, next.clone()).unwrap().to_string().len();
+            assert!(entries(&next).len() <= 2, "a patch sends what changed: {next}");
+        }
+        state = arugula_proto::block_patch::merge(&state, next).expect("each patch follows the last");
+        if state["status"] == "ready"
+            && entries(&state).iter().any(|e| e["text"].as_str().is_some_and(|t| t.contains("w19")))
+        {
+            break;
+        }
+    }
+    eprintln!("{patches} patches: {sent} bytes, {whole} bytes whole");
+    assert!(patches > 0, "no patches");
+    assert_eq!(entries(&state), entries(&d.state(id)));
+}
+
+#[test]
 fn standing_rules_outlive_the_block_that_made_them() {
     // #166: "Always" for a directory or everywhere is the daemon's, not the
     // block's: the next block checks it, it survives a restart, and

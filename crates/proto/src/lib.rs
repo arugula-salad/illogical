@@ -18,6 +18,7 @@ pub use arugula_core::{
 
 pub mod api;
 pub mod ask;
+pub mod block_patch;
 pub mod dirs;
 #[cfg(feature = "fixtures")]
 pub mod fixture;
@@ -115,6 +116,10 @@ pub enum ClientMsg {
     /// Follow an editor (M28): its cursor, selection and the file it shows
     /// come as [`ServerMsg::Follow`] while `on`. Viewer access is enough.
     Follow { pane: PaneId, on: bool },
+    /// Send this client agent blocks' states as what changed since the last
+    /// one it was sent ([`block_patch`], #713) rather than whole. Sent
+    /// again, it starts over: each block's next state comes whole.
+    BlockPatches,
     /// Join the huddle on `session` (M63), starting one if there's none.
     /// Anyone with a role in the session may, up to [`CALL_MAX`] people.
     CallJoin { session: SessionId },
@@ -631,7 +636,9 @@ pub enum ServerMsg {
     /// An intent failed.
     Error { id: Option<u64>, message: String },
     /// A non-terminal block's state, whole: on connecting, and whenever it
-    /// changes. Its type's renderer draws it.
+    /// changes. Its type's renderer draws it. For a client that asked for
+    /// [`ClientMsg::BlockPatches`], an agent block's may be a patch
+    /// ([`block_patch`]).
     Block {
         block: PaneId,
         #[cfg_attr(feature = "ts", ts(type = "unknown"))]
