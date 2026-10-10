@@ -24,7 +24,13 @@ pub(super) struct Task {
     output: Option<PathBuf>,
     /// When it ends at the latest (a Monitor's timeout).
     until: Option<Instant>,
+    /// When it started: where its output goes comes in the next update.
+    seen: Instant,
 }
+
+/// How long a shell task may go without its output named before it's
+/// taken as one that can't be checked.
+const NAMED_WITHIN: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Default)]
 pub(super) struct Background {
@@ -40,14 +46,14 @@ impl Background {
         let cc = &u["_meta"]["claudeCode"];
         let response = &cc["toolResponse"];
         if let Some(id) = response["backgroundTaskId"].as_str() {
-            self.start(id, None);
+            self.start(id, None, now);
         } else if cc["toolName"] == "Monitor"
             && let Some(id) = response["taskId"].as_str()
         {
             // One that lasts the session has no end to wait for.
             if response["persistent"] != true {
                 let ms = response["timeoutMs"].as_u64().unwrap_or(300_000);
-                self.start(id, Some(now + Duration::from_millis(ms)));
+                self.start(id, Some(now + Duration::from_millis(ms)), now);
             }
         }
         if self.tasks.iter().any(|t| t.output.is_none()) {
@@ -61,9 +67,9 @@ impl Background {
         }
     }
 
-    fn start(&mut self, id: &str, until: Option<Instant>) {
+    fn start(&mut self, id: &str, until: Option<Instant>, now: Instant) {
         if !self.tasks.iter().any(|t| t.id == id) {
-            self.tasks.push(Task { id: id.to_owned(), output: None, until });
+            self.tasks.push(Task { id: id.to_owned(), output: None, until, seen: now });
         }
     }
 
@@ -78,8 +84,9 @@ impl Background {
             let output = t.output.clone().or_else(|| dir.as_ref().map(|d| d.join(format!("{}.output", t.id))));
             match output {
                 Some(path) => running(&path).unwrap_or(t.until.is_some()),
-                // A Monitor's timeout still bounds it.
-                None => t.until.is_some(),
+                // A Monitor's timeout still bounds it; a shell task's
+                // output may not be named yet.
+                None => t.until.is_some() || now < t.seen + NAMED_WITHIN,
             }
         });
         self.tasks.len() != before
@@ -189,6 +196,8 @@ mod tests {
         // A Monitor for the whole session.
         bg.saw(&json!({ "_meta": { "claudeCode": { "toolName": "Monitor", "toolResponse": { "taskId": "m1", "persistent": true } } } }), now);
         bg.prune(now);
+        assert_eq!(bg.ids(), ["b1"], "its output may yet be named");
+        bg.prune(now + NAMED_WITHIN);
         assert!(bg.ids().is_empty());
     }
 }

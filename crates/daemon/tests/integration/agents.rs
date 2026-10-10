@@ -527,12 +527,13 @@ fn wait_idle_waits_for_what_an_agent_left_running() {
     // running in the background carries on when it ends; `wait --idle`
     // waits for that. #700: the turn it wakes for counts as one.
     let d = Daemon::child();
-    let id = open_claude(&d, "bg 3");
-    d.wait_for("its background task", || d.state(id)["background"].as_array().is_some_and(|b| b.len() == 1));
-    assert_eq!(d.state(id)["attention"], "done", "its own turn ended");
-    let started = std::time::Instant::now();
+    let id = open_claude(&d, "bg 5");
+    d.wait_for("its turn to end with a task in the background", || {
+        let s = d.state(id);
+        s["attention"] == "done" && s["background"].as_array().is_some_and(|b| b.len() == 1)
+    });
     assert_eq!(d.wait(id, "idle"), "done");
-    assert!(started.elapsed() >= Duration::from_secs(2), "returned after {:?}", started.elapsed());
+    assert_eq!(d.state(id)["background"], json!([]), "the wait lasted until the task ended");
     d.wait_for("the turn it woke for", || d.state(id)["turns"] == 2);
     let s = d.state(id);
     assert_eq!(s["background"], json!([]), "{s}");
