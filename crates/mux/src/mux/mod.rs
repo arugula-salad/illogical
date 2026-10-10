@@ -481,6 +481,9 @@ struct Daemon {
     sent: HashMap<ClientId, Sent>,
     /// Clients that only want summaries (the swarm, the fleet).
     summary: std::collections::HashSet<ClientId>,
+    /// Clients that take agent blocks' states as patches (#713), with the
+    /// blocks each has whole, to patch.
+    patched: HashMap<ClientId, std::collections::HashSet<PaneId>>,
     /// Each pane's byte count at the last tick, and its activity.
     activity: HashMap<PaneId, (u64, Activity)>,
     last_tick: Instant,
@@ -616,6 +619,7 @@ pub fn start(config: Config, store: StateDir, kept: HashMap<String, Kept>) -> Mu
         flush_due: None,
         sent: HashMap::new(),
         summary: Default::default(),
+        patched: Default::default(),
         activity: HashMap::new(),
         last_tick: Instant::now(),
         procs: Default::default(),
@@ -860,6 +864,37 @@ impl Daemon {
         Some(ServerMsg::Block { block: id, state: self.blocks.get(&id)?.state() })
     }
 
+    /// A block's new state to everyone who sees it: as a patch to those that
+    /// take one and have the rest (#713), else whole.
+    fn send_block(&mut self, pane: PaneId) {
+        let Some(b) = self.blocks.get(&pane) else { return };
+        let (state, at) = match b.state_and_changed() {
+            Some((state, at)) => (state, Some(at)),
+            None => (b.state(), None),
+        };
+        let seen: Vec<(ClientId, bool)> =
+            self.clients.values().map(|c| (c.client, self.sees(&c.principal, pane))).collect();
+        let mut patch = None;
+        for (client, sees) in seen {
+            let has = self.patched.get_mut(&client);
+            if !sees {
+                // It misses what changes meanwhile: it starts whole again.
+                has.map(|h| h.remove(&pane));
+                continue;
+            }
+            let based = has.is_some_and(|h| !h.insert(pane));
+            let state = match at {
+                Some(at) if based => {
+                    patch.get_or_insert_with(|| arugula_proto::block_patch::to_patch(&state, at)).clone()
+                }
+                _ => state.clone(),
+            };
+            if let Some(sub) = self.clients.get(&client) {
+                let _ = sub.ctrl.send(ToClient::Msg(ServerMsg::Block { block: pane, state }));
+            }
+        }
+    }
+
     async fn run(mut self, mut rx: mpsc::UnboundedReceiver<Cmd>, mut notices: mpsc::UnboundedReceiver<Notice>) {
         let mut refresh = tokio::time::interval(REFRESH);
         let mut tick = tokio::time::interval(TICK);
@@ -965,11 +1000,7 @@ impl Daemon {
                 if self.blocks.get(&pane).is_some_and(|b| b.detached()) {
                     return;
                 }
-                if let Some(msg) = self.block_msg(pane) {
-                    for sub in self.clients.values().filter(|c| self.sees(&c.principal, pane)) {
-                        let _ = sub.ctrl.send(ToClient::Msg(msg.clone()));
-                    }
-                }
+                self.send_block(pane);
                 // Its config may have changed with it.
                 self.save_due.get_or_insert_with(|| Instant::now() + SAVE_DEBOUNCE);
             }
@@ -1156,6 +1187,7 @@ impl Daemon {
                 self.unfollow(client, None);
                 self.sent.remove(&client);
                 self.summary.remove(&client);
+                self.patched.remove(&client);
                 self.focus.remove(&client);
                 self.refused.remove(&client);
                 self.viewing.remove(&client);

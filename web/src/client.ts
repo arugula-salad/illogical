@@ -1167,6 +1167,9 @@ export class Client {
         this.probe = null;
         this.probedAt = this.helloAt;
         if (this.summary) this.send({ type: "subscribe", summary: true });
+        // #713: agent blocks' states as what changed. A daemon from before
+        // ignores this and sends them whole.
+        this.send({ type: "block_patches" });
         // A new connection: follow again what was followed.
         for (const pane of this.editorFollows.keys()) this.send({ type: "follow", pane, on: true });
         this.applyState(msg.state, true);
@@ -1238,13 +1241,23 @@ export class Client {
         break;
       case "block": {
         const b = this.blocks.get(msg.block);
+        let state = msg.state;
+        if (patchAt(state) !== undefined) {
+          // #713: what changed, on the state it has.
+          state = applyBlockPatch(b ? b.state : this.pendingBlocks.get(msg.block), state);
+          if (state === undefined) {
+            // It can't (it never should): start over, each block whole.
+            this.send({ type: "block_patches" });
+            break;
+          }
+        }
         if (b) {
-          b.state = msg.state;
-          b.view.update(msg.state);
+          b.state = state;
+          b.view.update(state);
           this.emit();
         } else {
           // Its state can arrive before the layout that has it.
-          this.pendingBlocks.set(msg.block, msg.state);
+          this.pendingBlocks.set(msg.block, state);
         }
         break;
       }
@@ -1514,4 +1527,28 @@ export function forgePr(uri: string): boolean {
   } catch {
     return false;
   }
+}
+
+/** Where a block state that's a patch (#713) starts its entries, or
+ * `undefined` when it's whole. */
+function patchAt(state: unknown): number | undefined {
+  const at = (state as { entries_at?: unknown } | null)?.entries_at;
+  return typeof at === "number" ? at : undefined;
+}
+
+type Windowed = { entries_from?: number; entries?: unknown[]; entries_at?: number };
+
+/** `patch` on `old`, whole (`crates/proto/src/block_patch.rs`): the patch's
+ * fields, and its entries after the ones `old` has before `entries_at`.
+ * `undefined` when `old` doesn't have them. */
+export function applyBlockPatch(old: unknown, patch: unknown): unknown {
+  if (!old || typeof old !== "object") return undefined;
+  const { entries_at: at = 0, ...rest } = patch as Windowed;
+  const from = rest.entries_from ?? 0;
+  const had = old as Windowed;
+  const hadFrom = had.entries_from ?? 0;
+  const hadEntries = had.entries ?? [];
+  if (at > from && (hadFrom > from || hadFrom + hadEntries.length < at)) return undefined;
+  const kept = at > from ? hadEntries.slice(from - hadFrom, at - hadFrom) : [];
+  return { ...rest, entries: [...kept, ...(rest.entries ?? [])] };
 }

@@ -44,6 +44,13 @@ pub trait Block: Send + Sync {
     fn config(&self) -> Value;
     /// What clients draw and `describe` returns.
     fn state(&self) -> Value;
+    /// Its state, and the first transcript entry that changed since the
+    /// last time this was asked (#713): clients that already have the rest
+    /// get it as a patch ([`arugula_proto::block_patch`]). `None`: it goes
+    /// whole.
+    fn state_and_changed(&self) -> Option<(Value, u64)> {
+        None
+    }
     /// A plain-text rendering, for `capture --text`, history and search.
     fn text(&self) -> String;
     /// One of the type's methods.

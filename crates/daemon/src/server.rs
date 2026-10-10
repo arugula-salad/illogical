@@ -10,7 +10,7 @@ use std::{
 };
 
 use arugula_proto::op::ops::SigninLinkGet;
-use arugula_proto::{ClientId, ClientMsg, Frame, FrameKind, ServerMsg};
+use arugula_proto::{ClientId, ClientMsg, Frame, FrameKind, PaneId, ServerMsg, block_patch};
 use axum::{
     Extension, Router,
     body::Body,
@@ -553,11 +553,12 @@ pub(crate) fn handle(app: &App, client: ClientId, msg: Message) -> anyhow::Resul
 const CTRL_BATCH: usize = 1024;
 
 /// `first` and what else is in a client's control queue now, with each
-/// block's state only at its newest (#713). A block's state is sent whole,
-/// so one still queued behind a newer one for the same block is never worth
-/// sending: a client that fell behind (a phone, a slow link, a busy page)
-/// skips to the latest instead of working through every state it missed.
-/// Everything else keeps its order, and nothing after a `Close` is taken.
+/// block's states merged into its newest (#713). A block's state is sent
+/// whole, or as a patch on the one before ([`block_patch`]), so one still
+/// queued behind a newer one for the same block folds into it: a client that
+/// fell behind (a phone, a slow link, a busy page) skips to the latest
+/// instead of working through every state it missed. Everything else keeps
+/// its order, and nothing after a `Close` is taken.
 pub(crate) fn ctrl_batch(first: ToClient, rx: &mut mpsc::UnboundedReceiver<ToClient>) -> Vec<ToClient> {
     let mut batch = vec![first];
     while batch.len() < CTRL_BATCH && !matches!(batch.last(), Some(ToClient::Close)) {
@@ -566,12 +567,30 @@ pub(crate) fn ctrl_batch(first: ToClient, rx: &mut mpsc::UnboundedReceiver<ToCli
             Err(_) => break,
         }
     }
-    let block = |o: &ToClient| match o {
-        ToClient::Msg(ServerMsg::Block { block, .. }) => Some(*block),
-        _ => None,
-    };
-    let newest: HashMap<_, _> = batch.iter().enumerate().filter_map(|(i, o)| Some((block(o)?, i))).collect();
-    batch.into_iter().enumerate().filter(|(i, o)| block(o).is_none_or(|b| newest[&b] == *i)).map(|(_, o)| o).collect()
+    let mut out: Vec<Option<ToClient>> = Vec::with_capacity(batch.len());
+    let mut last: HashMap<PaneId, usize> = HashMap::new();
+    for o in batch {
+        let ToClient::Msg(ServerMsg::Block { block, state }) = o else {
+            out.push(Some(o));
+            continue;
+        };
+        let merged = last.get(&block).and_then(|&i| match &out[i] {
+            Some(ToClient::Msg(ServerMsg::Block { state: older, .. })) => {
+                Some((i, block_patch::merge(older, state.clone())?))
+            }
+            _ => None,
+        });
+        let state = match merged {
+            Some((i, m)) => {
+                out[i] = None;
+                m
+            }
+            None => state,
+        };
+        last.insert(block, out.len());
+        out.push(Some(ToClient::Msg(ServerMsg::Block { block, state })));
+    }
+    out.into_iter().flatten().collect()
 }
 
 async fn send(socket: &mut WebSocket, out: ToClient) -> Result<(), axum::Error> {
@@ -619,6 +638,20 @@ mod tests {
         tx.send(state(7, 5)).unwrap();
         let next = rx.try_recv().unwrap();
         assert_eq!(said(&ctrl_batch(next, &mut rx)), ["7:5"]);
+    }
+
+    #[test]
+    fn patches_queued_behind_a_state_fold_into_it() {
+        // A client that takes patches and fell behind gets the state they
+        // add up to, once.
+        let entries = |from: u64, es: &[&str]| json!({ "entries_from": from, "entries": es });
+        let block = |state| ToClient::Msg(ServerMsg::Block { block: 7, state });
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        tx.send(block(block_patch::to_patch(&entries(0, &["a", "b", "c"]), 2))).unwrap();
+        tx.send(block(block_patch::to_patch(&entries(1, &["b", "c", "d"]), 3))).unwrap();
+        let batch = ctrl_batch(block(entries(0, &["a", "b"])), &mut rx);
+        let [ToClient::Msg(ServerMsg::Block { state, .. })] = &batch[..] else { panic!("{batch:?}") };
+        assert_eq!(*state, entries(1, &["b", "c", "d"]));
     }
 
     #[test]

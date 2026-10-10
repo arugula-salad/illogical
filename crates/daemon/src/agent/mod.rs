@@ -361,6 +361,9 @@ struct Inner {
     generation: u64,
     pid: Option<u32>,
     reported: Option<Attention>,
+    /// The transcript window clients were last sent, as where it starts and
+    /// a hash of each entry (#713): the next state goes as what changed.
+    sent: (usize, Vec<u64>),
     closing: bool,
     /// While rebuilding from the log, effects aren't acted on.
     live: bool,
@@ -495,6 +498,7 @@ impl Inner {
             generation: 0,
             pid: None,
             reported: None,
+            sent: (0, Vec::new()),
             closing: false,
             live: false,
             frozen: false,
@@ -1206,6 +1210,27 @@ impl Inner {
     /// What the block is called: the person's title, else the session's.
     fn shown_title(&self) -> Option<String> {
         self.cfg.title.clone().or_else(|| self.title.clone())
+    }
+
+    /// Its state, and the first entry that changed since the last time
+    /// this was asked (#713).
+    fn state_and_changed(&mut self, ctx: &AgentCtx) -> (Value, u64) {
+        let state = self.state(ctx);
+        let from = state["entries_from"].as_u64().unwrap_or(0) as usize;
+        let hashes: Vec<u64> =
+            state["entries"].as_array().map(|es| es.iter().map(|e| hash(&e.to_string())).collect()).unwrap_or_default();
+        let (was_from, was) = &self.sent;
+        let start = from.max(*was_from);
+        let same = (start..)
+            .take_while(|i| {
+                let now = hashes.get(i - from);
+                now.is_some() && now == i.checked_sub(*was_from).and_then(|j| was.get(j))
+            })
+            .count();
+        // A window that moved back (it can't) is all new.
+        let changed = if from < *was_from { from } else { start + same };
+        self.sent = (from, hashes);
+        (state, changed as u64)
     }
 
     fn state(&self, ctx: &AgentCtx) -> Value {
@@ -2764,6 +2789,10 @@ impl Block for Agent {
         self.inner.lock().unwrap().state(&self.ctx)
     }
 
+    fn state_and_changed(&self) -> Option<(Value, u64)> {
+        Some(self.inner.lock().unwrap().state_and_changed(&self.ctx))
+    }
+
     #[cfg(feature = "labs")]
     fn wrote_run(&self, id: &str) -> bool {
         self.inner.lock().unwrap().turns.iter().any(|t| t.run.as_deref() == Some(id))
@@ -2896,6 +2925,14 @@ impl Block for Agent {
 }
 
 /// A list of strings, skipping anything else.
+/// An entry's fingerprint, to tell what changed since clients last saw it.
+fn hash(s: &str) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    s.hash(&mut h);
+    h.finish()
+}
+
 fn strings(v: &Value) -> Vec<String> {
     v.as_array().into_iter().flatten().filter_map(|s| s.as_str().map(str::to_owned)).collect()
 }
