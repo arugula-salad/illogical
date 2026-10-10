@@ -108,7 +108,7 @@ dependencies = [
 
 [[package]]
 name = "arugula-desktop"
-version = "0.26.3"
+version = "0.26.4"
 dependencies = [
  "anyhow",
  "arugula-proto",
