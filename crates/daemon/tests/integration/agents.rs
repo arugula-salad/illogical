@@ -502,16 +502,43 @@ fn wait_reconnects_when_the_daemon_restarts() {
 fn a_turn_whose_prompt_is_held_for_background_work_is_not_working() {
     // #681: claude-agent-acp delivers a turn's result, then holds the answer
     // to `session/prompt` while background subagents live. The block says
-    // so, and `wait --idle` returns.
+    // it's idle, but `wait --idle` waits for the real end (#606), and a
+    // cancel gets on to what's queued rather than dropping it.
     let d = Daemon::child();
-    let name = "FAKE_ACP_NAME=@agentclientprotocol/claude-agent-acp";
-    let config =
-        json!({ "agent": "acp", "command": ["env", name, "python3", fake()], "cwd": d.sessions, "prompt": "held" });
-    let id = d.open_with(json!({ "type": "agent", "config": config }));
-    assert_eq!(d.wait(id, "idle"), "idle");
+    let id = open_claude(&d, "held");
+    d.wait_for("the turn to be held", || d.state(id)["held"] == true);
     let s = d.state(id);
+    assert_eq!(s["attention"], "idle", "{s}");
     assert_eq!(s["status"], "working", "the prompt is still open: {s}");
     assert!(entries(&s).iter().any(|e| e["type"] == "agent" && e["text"] == "All done; the report is above."), "{s}");
+    let v = d.get(&format!("/api/panes/{id}/wait?until=idle&timeout=1"));
+    assert_eq!(v["result"], "timeout", "{v}");
+    d.call(id, "send", json!({ "text": "hello" }));
+    d.call(id, "cancel", json!({}));
+    d.wait_for("the queued prompt to go", || {
+        entries(&d.state(id)).iter().any(|e| e["type"] == "agent" && e["text"] == "Hello! I am fake.")
+    });
+    assert_eq!(d.wait(id, "idle"), "done");
+}
+
+#[test]
+fn wait_idle_waits_for_what_an_agent_left_running() {
+    // #606: a Claude Code agent that ended its turn with a shell command
+    // running in the background carries on when it ends; `wait --idle`
+    // waits for that. #700: the turn it wakes for counts as one.
+    let d = Daemon::child();
+    let id = open_claude(&d, "bg 5");
+    d.wait_for("its turn to end with a task in the background", || {
+        let s = d.state(id);
+        s["attention"] == "done" && s["background"].as_array().is_some_and(|b| b.len() == 1)
+    });
+    assert_eq!(d.wait(id, "idle"), "done");
+    assert_eq!(d.state(id)["background"], json!([]), "the wait lasted until the task ended");
+    d.wait_for("the turn it woke for", || d.state(id)["turns"] == 2);
+    let s = d.state(id);
+    assert_eq!(s["background"], json!([]), "{s}");
+    assert!(entries(&s).iter().any(|e| e["text"] == "The background task finished."), "{s}");
+    assert_eq!(s["recent_turns"][0]["prompt"], "(woken by a background task)", "{s}");
 }
 
 /// A claude-agent-acp block whose first prompt is `prompt`.
